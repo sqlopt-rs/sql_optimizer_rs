@@ -136,7 +136,8 @@ pub fn rewrite(query: &str) -> Result<RewriteResult, SqlOptError> {
 
     let mut warnings = Vec::new();
     if select_has_wildcard(&select) {
-        warnings.push("avoid SELECT *; select only needed columns".to_string());
+        warnings
+            .push("avoid wildcard projections (SELECT *); select only needed columns".to_string());
     }
 
     if select.from.len() != 1 {
@@ -256,9 +257,24 @@ pub fn rewrite(query: &str) -> Result<RewriteResult, SqlOptError> {
         });
     }
 
+    if !projection_is_safe_for_join_to_in(&select.projection, &left_table.1) {
+        warnings.push(
+            "rewrite is not applied because projection may depend on the joined table".to_string(),
+        );
+        return Ok(RewriteResult {
+            original,
+            rewritten: None,
+            applied_rules: Vec::new(),
+            warnings,
+        });
+    }
+
+    let projection = projection_sql(&select.projection);
+
     let where_expr = strip_qualifier(selection.clone(), &right_table.1);
     let rewritten = format!(
-        "SELECT {left_q}.* FROM {left_table}{left_alias} WHERE {left_q}.{left_join_col} IN (SELECT {right_join_col} FROM {right_table} WHERE {where_expr})",
+        "SELECT {projection} FROM {left_table}{left_alias} WHERE {left_q}.{left_join_col} IN (SELECT {right_join_col} FROM {right_table} WHERE {where_expr})",
+        projection = projection,
         left_q = left_table.1,
         left_table = left_table.0,
         left_alias = alias_clause(left_table.2.as_deref()),
@@ -778,6 +794,51 @@ fn select_has_wildcard(select: &sqlparser::ast::Select) -> bool {
     })
 }
 
+fn projection_is_safe_for_join_to_in(projection: &[SelectItem], left_qualifier: &str) -> bool {
+    if projection.is_empty() {
+        return false;
+    }
+
+    for item in projection {
+        match item {
+            SelectItem::Wildcard(_) => return false,
+            SelectItem::QualifiedWildcard(kind, _) => match kind {
+                sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(object_name) => {
+                    let qualifier = object_name
+                        .0
+                        .last()
+                        .and_then(ObjectNamePart::as_ident)
+                        .map(|ident| ident.value.as_str());
+                    if qualifier != Some(left_qualifier) {
+                        return false;
+                    }
+                }
+                sqlparser::ast::SelectItemQualifiedWildcardKind::Expr(_) => return false,
+            },
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                let mut refs = Vec::new();
+                collect_column_refs(expr, &mut refs);
+                for column_ref in refs {
+                    match column_ref.qualifier.as_deref() {
+                        Some(q) if q == left_qualifier => {}
+                        _ => return false,
+                    }
+                }
+            }
+        }
+    }
+
+    true
+}
+
+fn projection_sql(projection: &[SelectItem]) -> String {
+    projection
+        .iter()
+        .map(|item| item.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn estimate_index_benefit_ms(table: &str, columns: &[&str]) -> (u64, u64, u8) {
     let row_count = mock_row_count(table);
     let before_ms = (row_count / 4_000).max(1);
@@ -1033,6 +1094,19 @@ fn strip_qualifier(expr: Expr, qualifier: &str) -> Expr {
         },
         Expr::IsNull(expr) => Expr::IsNull(Box::new(strip_qualifier(*expr, qualifier))),
         Expr::IsNotNull(expr) => Expr::IsNotNull(Box::new(strip_qualifier(*expr, qualifier))),
+        Expr::Function(mut func) => {
+            strip_qualifier_in_function_arguments(&mut func.parameters, qualifier);
+            strip_qualifier_in_function_arguments(&mut func.args, qualifier);
+
+            if let Some(filter) = func.filter.as_mut() {
+                **filter = strip_qualifier((**filter).clone(), qualifier);
+            }
+            for order_by in &mut func.within_group {
+                strip_qualifier_in_order_by_expr(order_by, qualifier);
+            }
+
+            Expr::Function(func)
+        }
         Expr::Cast {
             kind,
             expr,
@@ -1045,6 +1119,73 @@ fn strip_qualifier(expr: Expr, qualifier: &str) -> Expr {
             format,
         },
         other => other,
+    }
+}
+
+fn strip_qualifier_in_function_arguments(
+    arguments: &mut sqlparser::ast::FunctionArguments,
+    qualifier: &str,
+) {
+    match arguments {
+        sqlparser::ast::FunctionArguments::None => {}
+        sqlparser::ast::FunctionArguments::Subquery(_) => {}
+        sqlparser::ast::FunctionArguments::List(list) => {
+            for arg in &mut list.args {
+                match arg {
+                    sqlparser::ast::FunctionArg::Named { arg, .. }
+                    | sqlparser::ast::FunctionArg::Unnamed(arg) => {
+                        strip_qualifier_in_function_arg_expr(arg, qualifier);
+                    }
+                    sqlparser::ast::FunctionArg::ExprNamed { name, arg, .. } => {
+                        *name = strip_qualifier(name.clone(), qualifier);
+                        strip_qualifier_in_function_arg_expr(arg, qualifier);
+                    }
+                }
+            }
+
+            for clause in &mut list.clauses {
+                match clause {
+                    sqlparser::ast::FunctionArgumentClause::OrderBy(order_by) => {
+                        for expr in order_by {
+                            strip_qualifier_in_order_by_expr(expr, qualifier);
+                        }
+                    }
+                    sqlparser::ast::FunctionArgumentClause::Limit(expr) => {
+                        *expr = strip_qualifier(expr.clone(), qualifier);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn strip_qualifier_in_function_arg_expr(
+    expr: &mut sqlparser::ast::FunctionArgExpr,
+    qualifier: &str,
+) {
+    match expr {
+        sqlparser::ast::FunctionArgExpr::Expr(expr) => {
+            *expr = strip_qualifier(expr.clone(), qualifier);
+        }
+        sqlparser::ast::FunctionArgExpr::QualifiedWildcard(_)
+        | sqlparser::ast::FunctionArgExpr::Wildcard => {}
+    }
+}
+
+fn strip_qualifier_in_order_by_expr(order_by: &mut sqlparser::ast::OrderByExpr, qualifier: &str) {
+    order_by.expr = strip_qualifier(order_by.expr.clone(), qualifier);
+
+    if let Some(with_fill) = order_by.with_fill.as_mut() {
+        if let Some(expr) = with_fill.from.as_mut() {
+            *expr = strip_qualifier(expr.clone(), qualifier);
+        }
+        if let Some(expr) = with_fill.to.as_mut() {
+            *expr = strip_qualifier(expr.clone(), qualifier);
+        }
+        if let Some(expr) = with_fill.step.as_mut() {
+            *expr = strip_qualifier(expr.clone(), qualifier);
+        }
     }
 }
 
@@ -1090,11 +1231,42 @@ SELECT * FROM users WHERE id = 5;
 
     #[test]
     fn rewrite_join_to_in_works_for_simple_filter_join() {
-        let query = "SELECT * FROM orders o JOIN users u ON o.user_id = u.id WHERE u.active = true";
+        let query =
+            "SELECT o.* FROM orders o JOIN users u ON o.user_id = u.id WHERE u.active = true";
         let rewritten = rewrite(query).unwrap().rewritten.unwrap();
         assert_eq!(
             rewritten,
             "SELECT o.* FROM orders o WHERE o.user_id IN (SELECT id FROM users WHERE active = true)"
+        );
+    }
+
+    #[test]
+    fn rewrite_join_to_in_refuses_when_projection_mentions_joined_table() {
+        let query = "SELECT o.id, u.name FROM orders o JOIN users u ON o.user_id = u.id WHERE u.active = true";
+        let result = rewrite(query).unwrap();
+        assert!(result.rewritten.is_none());
+    }
+
+    #[test]
+    fn rewrite_join_to_in_refuses_when_projection_is_unqualified_or_star() {
+        let query = "SELECT * FROM orders o JOIN users u ON o.user_id = u.id WHERE u.active = true";
+        let result = rewrite(query).unwrap();
+        assert!(result.rewritten.is_none());
+
+        let query =
+            "SELECT name FROM orders o JOIN users u ON o.user_id = u.id WHERE u.active = true";
+        let result = rewrite(query).unwrap();
+        assert!(result.rewritten.is_none());
+    }
+
+    #[test]
+    fn rewrite_join_to_in_strips_qualifier_inside_function_where() {
+        let query =
+            "SELECT o.* FROM orders o JOIN users u ON o.user_id = u.id WHERE upper(u.name) = 'BOB'";
+        let rewritten = rewrite(query).unwrap().rewritten.unwrap();
+        assert_eq!(
+            rewritten,
+            "SELECT o.* FROM orders o WHERE o.user_id IN (SELECT id FROM users WHERE upper(name) = 'BOB')"
         );
     }
 
