@@ -324,7 +324,8 @@ pub fn normalize_query_template(query: &str) -> String {
             continue;
         }
 
-        if ch == '-' && matches!(chars.peek(), Some(peek) if peek.is_ascii_digit()) {
+        if ch == '-' && matches!(chars.peek(), Some(peek) if peek.is_ascii_digit() || *peek == '.')
+        {
             out.push('?');
             while matches!(chars.peek(), Some(peek) if peek.is_ascii_digit() || *peek == '.') {
                 chars.next();
@@ -521,9 +522,9 @@ fn collect_index_candidates_from_select(
     }
 
     for table_with_joins in &select.from {
-        collect_index_candidates_from_table_factor(&table_with_joins.relation, out);
+        collect_index_candidates_from_table_factor(&table_with_joins.relation, &ctx, out);
         for join in &table_with_joins.joins {
-            collect_index_candidates_from_table_factor(&join.relation, out);
+            collect_index_candidates_from_table_factor(&join.relation, &ctx, out);
             let constraint = match &join.join_operator {
                 JoinOperator::Join(constraint)
                 | JoinOperator::Inner(constraint)
@@ -544,6 +545,7 @@ fn collect_index_candidates_from_select(
 
 fn collect_index_candidates_from_table_factor(
     table_factor: &TableFactor,
+    ctx: &ResolveContext,
     out: &mut BTreeSet<(String, String)>,
 ) {
     match table_factor {
@@ -555,7 +557,7 @@ fn collect_index_candidates_from_table_factor(
                 collect_index_candidates_from_query(subquery, out);
             }
             for join in &table_with_joins.joins {
-                collect_index_candidates_from_table_factor(&join.relation, out);
+                collect_index_candidates_from_table_factor(&join.relation, ctx, out);
                 if let JoinOperator::Join(sqlparser::ast::JoinConstraint::On(expr))
                 | JoinOperator::Inner(sqlparser::ast::JoinConstraint::On(expr))
                 | JoinOperator::Left(sqlparser::ast::JoinConstraint::On(expr))
@@ -566,7 +568,7 @@ fn collect_index_candidates_from_table_factor(
                 | JoinOperator::CrossJoin(sqlparser::ast::JoinConstraint::On(expr)) =
                     &join.join_operator
                 {
-                    collect_subqueries(expr, out);
+                    collect_predicate_candidates(expr, ctx, out);
                 }
             }
         }
@@ -1203,6 +1205,15 @@ mod tests {
     }
 
     #[test]
+    fn normalize_query_template_handles_negative_leading_decimal() {
+        let input = "SELECT * FROM t WHERE x = -.123 AND y = -0.456;";
+        assert_eq!(
+            normalize_query_template(input),
+            "select * from t where x = ? and y = ?"
+        );
+    }
+
+    #[test]
     fn detect_n1_from_log_flags_repeated_templates() {
         let log = r#"
 SELECT * FROM users WHERE id = 1;
@@ -1268,6 +1279,43 @@ SELECT * FROM users WHERE id = 5;
             rewritten,
             "SELECT o.* FROM orders o WHERE o.user_id IN (SELECT id FROM users WHERE upper(name) = 'BOB')"
         );
+    }
+
+    #[test]
+    fn collect_index_candidates_includes_nested_join_on_columns() {
+        let query = "SELECT * FROM orders JOIN (users JOIN accounts ON users.account_id = accounts.id) ON orders.user_id = users.id";
+        let statement = parse_single_statement(query).unwrap();
+
+        let select = match &statement {
+            Statement::Query(query) => match query.body.as_ref() {
+                SetExpr::Select(select) => select.as_ref(),
+                _ => panic!("expected SELECT"),
+            },
+            _ => panic!("expected query statement"),
+        };
+        assert_eq!(select.from.len(), 1);
+        assert_eq!(select.from[0].joins.len(), 1);
+        assert!(
+            matches!(
+                &select.from[0].joins[0].relation,
+                TableFactor::NestedJoin { .. }
+            ),
+            "expected join relation to be a NestedJoin"
+        );
+
+        let mut candidates = BTreeSet::new();
+        collect_index_candidates_from_statement(&statement, &mut candidates).unwrap();
+
+        let expected = vec![
+            ("accounts".to_string(), "id".to_string()),
+            ("orders".to_string(), "user_id".to_string()),
+            ("users".to_string(), "account_id".to_string()),
+            ("users".to_string(), "id".to_string()),
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+
+        assert_eq!(candidates, expected);
     }
 
     #[test]
