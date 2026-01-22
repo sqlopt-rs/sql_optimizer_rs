@@ -14,7 +14,7 @@ fn run_sqlopt(args: &[&str]) -> (i32, String, String) {
 #[test]
 fn e2e_chains_rewrite_analyze_and_detect_n1() {
     let join_query =
-        "SELECT * FROM orders o JOIN users u ON o.user_id = u.id WHERE u.active = true";
+        "SELECT o.* FROM orders o JOIN users u ON o.user_id = u.id WHERE u.active = true";
 
     let (code, stdout, stderr) = run_sqlopt(&["rewrite", join_query]);
     assert_eq!(code, 0, "stderr: {stderr}");
