@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: test
+        run: cargo test --workspace --locked
+
+  dialects:
+    name: dialect smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: test
+        run: cargo test -p sql_optimizer --locked collect_index_candidates_from_multiple_dialects
+
+  coverage:
+    name: coverage (tarpaulin)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: install tarpaulin
+        run: cargo install cargo-tarpaulin --version 0.35.1 --locked
+      - name: coverage
+        run: cargo tarpaulin -p sql_optimizer --locked --out Html --output-dir tarpaulin-report --fail-under 80
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarpaulin-report
+          path: tarpaulin-report/

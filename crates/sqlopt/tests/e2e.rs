@@ -64,6 +64,67 @@ SELECT * FROM users WHERE id = 5;
     );
 }
 
+#[test]
+fn e2e_analyze_prints_ok_when_no_suggestions() {
+    let (code, stdout, stderr) = run_sqlopt(&["analyze", "SELECT 1"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("WARNING:"), "{stdout}");
+    assert!(stdout.contains("OK: No index suggestions."), "{stdout}");
+}
+
+#[test]
+fn e2e_rewrite_prints_ok_when_no_rewrite_available() {
+    let (code, stdout, stderr) = run_sqlopt(&["rewrite", "SELECT * FROM users"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("ORIGINAL:"), "{stdout}");
+    assert!(
+        stdout.contains("OK: No rewrite available for this query."),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn e2e_detect_n1_prints_ok_when_below_threshold() {
+    let log_path = temp_log_path("sqlopt_e2e_queries_below_threshold.log");
+    let log = r#"
+SELECT * FROM users WHERE id = 1;
+SELECT * FROM users WHERE id = 2;
+"#;
+    fs::write(&log_path, log).expect("write log");
+
+    let (code, stdout, stderr) = run_sqlopt(&[
+        "detect-n1",
+        log_path.to_str().expect("utf-8 path"),
+        "--threshold",
+        "5",
+        "--window",
+        "10",
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains("OK: No repeated query templates found"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn e2e_analyze_errors_on_invalid_sql() {
+    let (code, _stdout, stderr) = run_sqlopt(&["analyze", "SELECT FROM"]);
+    assert_ne!(code, 0, "stderr: {stderr}");
+    assert!(stderr.contains("failed to parse SQL"), "{stderr}");
+}
+
+#[test]
+fn e2e_detect_n1_errors_on_missing_log_file() {
+    let log_path = temp_log_path("does_not_exist.log");
+    let _ = fs::remove_file(&log_path);
+
+    let (code, _stdout, stderr) =
+        run_sqlopt(&["detect-n1", log_path.to_str().expect("utf-8 path")]);
+    assert_ne!(code, 0, "stderr: {stderr}");
+    assert!(stderr.contains("failed to read log file"), "{stderr}");
+}
+
 fn temp_log_path(file_name: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
     path.push(format!("sqlopt-{}", std::process::id()));
