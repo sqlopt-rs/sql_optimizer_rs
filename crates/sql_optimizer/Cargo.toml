@@ -7,3 +7,7 @@ license.workspace = true
 [dependencies]
 sqlparser = "0.60.0"
 thiserror = "2.0.18"
+
+[[bench]]
+name = "index_suggestion"
+harness = false

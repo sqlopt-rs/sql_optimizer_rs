@@ -372,15 +372,10 @@ pub fn detect_n1_from_log(log_contents: &str, opts: N1Options) -> N1Report {
         *total_counts.entry(template.clone()).or_default() += 1;
 
         window_queue.push_back(template.clone());
-        let current = {
+        {
             let entry = window_counts.entry(template.clone()).or_default();
             *entry += 1;
-            *entry
-        };
-        max_in_window
-            .entry(template.clone())
-            .and_modify(|max| *max = (*max).max(current))
-            .or_insert(current);
+        }
 
         if window_queue.len() > window {
             if let Some(oldest) = window_queue.pop_front() {
@@ -392,6 +387,12 @@ pub fn detect_n1_from_log(log_contents: &str, opts: N1Options) -> N1Report {
                 }
             }
         }
+
+        let current = window_counts.get(&template).copied().unwrap_or(0);
+        max_in_window
+            .entry(template)
+            .and_modify(|max| *max = (*max).max(current))
+            .or_insert(current);
     }
 
     let mut findings = max_in_window
