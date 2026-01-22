@@ -11,12 +11,17 @@ fn parse_iterations(args: impl Iterator<Item = String>) -> Result<u64, String> {
         }
 
         if arg.starts_with('-') {
-            continue;
+            return Err(format!("unknown argument: {arg}\n\n{}", usage()));
         }
 
         let cleaned = arg.replace('_', "");
         match cleaned.parse::<u64>() {
-            Ok(parsed) if parsed > 0 => value = Some(parsed),
+            Ok(parsed) if parsed > 0 => {
+                if value.is_some() {
+                    return Err(format!("too many arguments: {arg}\n\n{}", usage()));
+                }
+                value = Some(parsed);
+            }
             _ => return Err(format!("invalid iterations value: {arg}\n\n{}", usage())),
         }
     }
