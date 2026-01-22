@@ -1763,4 +1763,29 @@ SELECT * FROM c WHERE id = 1;
         ]);
         assert_eq!(strip_qualifier(expr.clone(), "u"), expr);
     }
+
+    #[test]
+    fn strip_qualifier_strips_inside_function_argument_clauses() {
+        let dialect = PostgreSqlDialect {};
+        let statement = Parser::parse_sql(
+            &dialect,
+            "SELECT array_agg(u.id ORDER BY u.id) FROM users u",
+        )
+        .unwrap()
+        .remove(0);
+
+        let expr = match statement {
+            Statement::Query(query) => match *query.body {
+                SetExpr::Select(select) => match &select.projection[0] {
+                    SelectItem::UnnamedExpr(expr) => expr.clone(),
+                    other => panic!("expected expression projection, got {other:?}"),
+                },
+                other => panic!("expected SELECT, got {other:?}"),
+            },
+            other => panic!("expected query, got {other:?}"),
+        };
+
+        let stripped = strip_qualifier(expr, "u");
+        assert_eq!(stripped.to_string(), "array_agg(id ORDER BY id)");
+    }
 }
