@@ -60,7 +60,7 @@ cargo bench --bench index_suggestion -- 1_000_000
 
 Result (this machine):
 
-| Workload | Iterations | Elapsed | Throughput |
+| Workload | Iterations | Elapsed (s) | Throughput (queries/s) |
 | --- | ---: | ---: | ---: |
 | index_suggestion | 1,000,000 | 8.864s | 112,814 queries/s |
 
