@@ -1,0 +1,10 @@
+[package]
+name = "sqlopt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.100"
+clap = { version = "4.5.54", features = ["derive"] }
+sql_optimizer = { path = "../sql_optimizer" }
