@@ -1,7 +1,8 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use sqlparser::ast::{
-    BinaryOperator, Expr, JoinOperator, ObjectNamePart, SetExpr, Statement, TableFactor,
+    BinaryOperator, Expr, JoinOperator, ObjectNamePart, Query, SelectItem, SetExpr, Statement,
+    TableFactor,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -15,11 +16,15 @@ pub enum SqlOptError {
     Unsupported(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexSuggestion {
     pub table: String,
-    pub column: String,
-    pub statement: String,
+    pub columns: Vec<String>,
+    pub ddl: String,
+    pub reason: String,
+    pub estimated_before_ms: u64,
+    pub estimated_after_ms: u64,
+    pub estimated_improvement_pct: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,18 +37,27 @@ pub struct AnalyzeResult {
 pub struct RewriteResult {
     pub original: String,
     pub rewritten: Option<String>,
+    pub applied_rules: Vec<&'static str>,
     pub warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct N1Options {
+    pub threshold: usize,
+    pub window: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct N1Finding {
     pub template: String,
-    pub count: usize,
+    pub max_count_in_window: usize,
+    pub total_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct N1Report {
     pub threshold: usize,
+    pub window: usize,
     pub findings: Vec<N1Finding>,
 }
 
@@ -55,82 +69,31 @@ struct ColumnRef {
 
 pub fn analyze(query: &str) -> Result<AnalyzeResult, SqlOptError> {
     let statement = parse_single_statement(query)?;
-    let select = match statement {
-        Statement::Query(query) => match *query.body {
-            SetExpr::Select(select) => select,
-            _ => {
-                return Err(SqlOptError::Unsupported(
-                    "only SELECT queries are supported".to_string(),
-                ));
-            }
-        },
-        _ => {
-            return Err(SqlOptError::Unsupported(
-                "only queries are supported".to_string(),
-            ));
-        }
-    };
 
-    let alias_to_table = build_alias_to_table(&select);
-    let base_table = if select.from.len() == 1 && select.from[0].joins.is_empty() {
-        alias_to_table
-            .values()
-            .next()
-            .cloned()
-            .or_else(|| table_factor_name(&select.from[0].relation))
-    } else {
-        None
-    };
+    let mut candidates = BTreeSet::<(String, String)>::new();
+    collect_index_candidates_from_statement(&statement, &mut candidates)?;
 
-    let mut refs = Vec::new();
-    if let Some(selection) = select.selection.as_ref() {
-        collect_column_refs(selection, &mut refs);
-    }
-    for table_with_joins in &select.from {
-        for join in &table_with_joins.joins {
-            let constraint = match &join.join_operator {
-                JoinOperator::Join(constraint)
-                | JoinOperator::Inner(constraint)
-                | JoinOperator::Left(constraint)
-                | JoinOperator::LeftOuter(constraint)
-                | JoinOperator::Right(constraint)
-                | JoinOperator::RightOuter(constraint)
-                | JoinOperator::FullOuter(constraint)
-                | JoinOperator::CrossJoin(constraint) => Some(constraint),
-                _ => None,
-            };
-            if let Some(sqlparser::ast::JoinConstraint::On(expr)) = constraint {
-                collect_column_refs(expr, &mut refs);
-            }
-        }
-    }
-
-    let mut pairs = BTreeSet::<(String, String)>::new();
-    for column_ref in refs {
-        let table = match column_ref.qualifier.as_deref() {
-            Some(qualifier) => alias_to_table
-                .get(qualifier)
-                .cloned()
-                .unwrap_or_else(|| qualifier.to_string()),
-            None => match base_table.as_deref() {
-                Some(table) => table.to_string(),
-                None => continue,
-            },
-        };
-        pairs.insert((table, column_ref.column));
-    }
-
-    let index_suggestions = pairs
+    let index_suggestions = candidates
         .into_iter()
-        .map(|(table, column)| IndexSuggestion {
-            statement: format!(
-                "CREATE INDEX {} ON {}({});",
-                format!("idx_{}_{}", ident_slug(&table), ident_slug(&column)),
+        .map(|(table, column)| {
+            let columns = vec![column.clone()];
+            let index_name = format!(
+                "idx_{}_{}",
+                ident_slug(&table),
+                ident_slug(columns.first().expect("1 column")),
+            );
+            let ddl = format!("CREATE INDEX CONCURRENTLY {index_name} ON {table}({column});");
+            let (estimated_before_ms, estimated_after_ms, estimated_improvement_pct) =
+                estimate_index_benefit_ms(&table, &[&column]);
+            IndexSuggestion {
                 table,
-                column,
-            ),
-            table,
-            column,
+                columns,
+                ddl,
+                reason: "used in WHERE/JOIN predicate".to_string(),
+                estimated_before_ms,
+                estimated_after_ms,
+                estimated_improvement_pct,
+            }
         })
         .collect::<Vec<_>>();
 
@@ -156,6 +119,7 @@ pub fn rewrite(query: &str) -> Result<RewriteResult, SqlOptError> {
                 return Ok(RewriteResult {
                     original,
                     rewritten: None,
+                    applied_rules: Vec::new(),
                     warnings: vec!["rewrite currently supports a single SELECT".to_string()],
                 });
             }
@@ -164,25 +128,35 @@ pub fn rewrite(query: &str) -> Result<RewriteResult, SqlOptError> {
             return Ok(RewriteResult {
                 original,
                 rewritten: None,
+                applied_rules: Vec::new(),
                 warnings: vec!["rewrite currently supports a single SELECT".to_string()],
             });
         }
     };
 
+    let mut warnings = Vec::new();
+    if select_has_wildcard(&select) {
+        warnings.push("avoid SELECT *; select only needed columns".to_string());
+    }
+
     if select.from.len() != 1 {
+        warnings.push("rewrite currently supports a single FROM entry".to_string());
         return Ok(RewriteResult {
             original,
             rewritten: None,
-            warnings: vec!["rewrite currently supports a single FROM entry".to_string()],
+            applied_rules: Vec::new(),
+            warnings,
         });
     }
 
     let table_with_joins = &select.from[0];
     if table_with_joins.joins.len() != 1 {
+        warnings.push("rewrite currently supports exactly one JOIN".to_string());
         return Ok(RewriteResult {
             original,
             rewritten: None,
-            warnings: vec!["rewrite currently supports exactly one JOIN".to_string()],
+            applied_rules: Vec::new(),
+            warnings,
         });
     }
 
@@ -193,10 +167,12 @@ pub fn rewrite(query: &str) -> Result<RewriteResult, SqlOptError> {
             alias.as_ref().map(|a| a.name.value.clone()),
         ),
         _ => {
+            warnings.push("rewrite currently supports table FROM".to_string());
             return Ok(RewriteResult {
                 original,
                 rewritten: None,
-                warnings: vec!["rewrite currently supports table FROM".to_string()],
+                applied_rules: Vec::new(),
+                warnings,
             });
         }
     };
@@ -209,10 +185,12 @@ pub fn rewrite(query: &str) -> Result<RewriteResult, SqlOptError> {
             alias.as_ref().map(|a| a.name.value.clone()),
         ),
         _ => {
+            warnings.push("rewrite currently supports table JOIN".to_string());
             return Ok(RewriteResult {
                 original,
                 rewritten: None,
-                warnings: vec!["rewrite currently supports table JOIN".to_string()],
+                applied_rules: Vec::new(),
+                warnings,
             });
         }
     };
@@ -221,18 +199,22 @@ pub fn rewrite(query: &str) -> Result<RewriteResult, SqlOptError> {
         JoinOperator::Join(constraint) | JoinOperator::Inner(constraint) => match constraint {
             sqlparser::ast::JoinConstraint::On(expr) => expr,
             _ => {
+                warnings.push("rewrite currently requires JOIN ... ON ...".to_string());
                 return Ok(RewriteResult {
                     original,
                     rewritten: None,
-                    warnings: vec!["rewrite currently requires JOIN ... ON ...".to_string()],
+                    applied_rules: Vec::new(),
+                    warnings,
                 });
             }
         },
         _ => {
+            warnings.push("rewrite currently supports JOIN/INNER JOIN".to_string());
             return Ok(RewriteResult {
                 original,
                 rewritten: None,
-                warnings: vec!["rewrite currently supports JOIN/INNER JOIN".to_string()],
+                applied_rules: Vec::new(),
+                warnings,
             });
         }
     };
@@ -241,10 +223,12 @@ pub fn rewrite(query: &str) -> Result<RewriteResult, SqlOptError> {
         match extract_join_columns(on_expr, &left_table.1, &right_table.1) {
             Some(pair) => pair,
             None => {
+                warnings.push("rewrite currently supports simple equality joins".to_string());
                 return Ok(RewriteResult {
                     original,
                     rewritten: None,
-                    warnings: vec!["rewrite currently supports simple equality joins".to_string()],
+                    applied_rules: Vec::new(),
+                    warnings,
                 });
             }
         };
@@ -252,19 +236,23 @@ pub fn rewrite(query: &str) -> Result<RewriteResult, SqlOptError> {
     let selection = match select.selection.as_ref() {
         Some(selection) => selection,
         None => {
+            warnings.push("rewrite requires a WHERE clause on the joined table".to_string());
             return Ok(RewriteResult {
                 original,
                 rewritten: None,
-                warnings: vec!["rewrite requires a WHERE clause on the joined table".to_string()],
+                applied_rules: Vec::new(),
+                warnings,
             });
         }
     };
 
     if !expr_refs_only_qualifier(selection, &right_table.1) {
+        warnings.push("rewrite requires WHERE to reference only the joined table".to_string());
         return Ok(RewriteResult {
             original,
             rewritten: None,
-            warnings: vec!["rewrite requires WHERE to reference only the joined table".to_string()],
+            applied_rules: Vec::new(),
+            warnings,
         });
     }
 
@@ -280,12 +268,13 @@ pub fn rewrite(query: &str) -> Result<RewriteResult, SqlOptError> {
         where_expr = where_expr,
     );
 
+    warnings
+        .push("heuristic rewrite: verify projection if you relied on JOINed columns".to_string());
     Ok(RewriteResult {
         original,
         rewritten: Some(rewritten),
-        warnings: vec![
-            "heuristic rewrite: verify projection if you relied on JOINed columns".to_string(),
-        ],
+        applied_rules: vec!["join_to_in"],
+        warnings,
     })
 }
 
@@ -343,33 +332,77 @@ pub fn normalize_query_template(query: &str) -> String {
     out.trim().to_string()
 }
 
-pub fn detect_n1_from_log(log_contents: &str, threshold: usize) -> N1Report {
-    let mut counts: HashMap<String, usize> = HashMap::new();
+pub fn detect_n1_from_log(log_contents: &str, opts: N1Options) -> N1Report {
+    let threshold = opts.threshold.max(1);
+    let window = opts.window.max(1);
+
+    let mut window_queue: VecDeque<String> = VecDeque::new();
+    let mut window_counts: HashMap<String, usize> = HashMap::new();
+    let mut total_counts: HashMap<String, usize> = HashMap::new();
+    let mut max_in_window: HashMap<String, usize> = HashMap::new();
+
     for line in log_contents.lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+        if line.is_empty() || line.starts_with('#') || line.starts_with("--") {
             continue;
         }
+
         let template = normalize_query_template(line);
         if template.is_empty() {
             continue;
         }
-        *counts.entry(template).or_default() += 1;
+
+        *total_counts.entry(template.clone()).or_default() += 1;
+
+        window_queue.push_back(template.clone());
+        let current = {
+            let entry = window_counts.entry(template.clone()).or_default();
+            *entry += 1;
+            *entry
+        };
+        max_in_window
+            .entry(template.clone())
+            .and_modify(|max| *max = (*max).max(current))
+            .or_insert(current);
+
+        if window_queue.len() > window {
+            if let Some(oldest) = window_queue.pop_front() {
+                if let Some(count) = window_counts.get_mut(&oldest) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        window_counts.remove(&oldest);
+                    }
+                }
+            }
+        }
     }
 
-    let mut findings = counts
+    let mut findings = max_in_window
         .into_iter()
-        .filter(|(_, count)| *count >= threshold)
-        .map(|(template, count)| N1Finding { template, count })
+        .filter_map(|(template, max_count_in_window)| {
+            if max_count_in_window < threshold {
+                return None;
+            }
+            let total_count = total_counts
+                .get(&template)
+                .copied()
+                .unwrap_or(max_count_in_window);
+            Some(N1Finding {
+                template,
+                max_count_in_window,
+                total_count,
+            })
+        })
         .collect::<Vec<_>>();
     findings.sort_by(|a, b| {
-        b.count
-            .cmp(&a.count)
+        b.max_count_in_window
+            .cmp(&a.max_count_in_window)
             .then_with(|| a.template.cmp(&b.template))
     });
 
     N1Report {
         threshold,
+        window,
         findings,
     }
 }
@@ -384,6 +417,407 @@ fn parse_single_statement(query: &str) -> Result<Statement, SqlOptError> {
         ));
     }
     Ok(statements.remove(0))
+}
+
+#[derive(Debug, Clone)]
+struct ResolveContext {
+    alias_to_table: HashMap<String, String>,
+    base_table: Option<String>,
+}
+
+fn collect_index_candidates_from_statement(
+    statement: &Statement,
+    out: &mut BTreeSet<(String, String)>,
+) -> Result<(), SqlOptError> {
+    match statement {
+        Statement::Query(query) => {
+            collect_index_candidates_from_query(query, out);
+            Ok(())
+        }
+        _ => Err(SqlOptError::Unsupported(
+            "only queries are supported".to_string(),
+        )),
+    }
+}
+
+fn collect_index_candidates_from_query(query: &Query, out: &mut BTreeSet<(String, String)>) {
+    if let Some(with) = query.with.as_ref() {
+        for cte in &with.cte_tables {
+            collect_index_candidates_from_query(&cte.query, out);
+        }
+    }
+
+    collect_index_candidates_from_setexpr(query.body.as_ref(), out);
+}
+
+fn collect_index_candidates_from_setexpr(setexpr: &SetExpr, out: &mut BTreeSet<(String, String)>) {
+    match setexpr {
+        SetExpr::Select(select) => collect_index_candidates_from_select(select.as_ref(), out),
+        SetExpr::Query(query) => collect_index_candidates_from_query(query.as_ref(), out),
+        SetExpr::SetOperation { left, right, .. } => {
+            collect_index_candidates_from_setexpr(left.as_ref(), out);
+            collect_index_candidates_from_setexpr(right.as_ref(), out);
+        }
+        _ => {}
+    }
+}
+
+fn collect_index_candidates_from_select(
+    select: &sqlparser::ast::Select,
+    out: &mut BTreeSet<(String, String)>,
+) {
+    let alias_to_table = build_alias_to_table(select);
+    let base_table = if select.from.len() == 1 && select.from[0].joins.is_empty() {
+        alias_to_table
+            .values()
+            .next()
+            .cloned()
+            .or_else(|| table_factor_name(&select.from[0].relation))
+    } else {
+        None
+    };
+
+    let ctx = ResolveContext {
+        alias_to_table,
+        base_table,
+    };
+
+    if let Some(expr) = select.prewhere.as_ref() {
+        collect_predicate_candidates(expr, &ctx, out);
+    }
+    if let Some(expr) = select.selection.as_ref() {
+        collect_predicate_candidates(expr, &ctx, out);
+    }
+    if let Some(expr) = select.having.as_ref() {
+        collect_predicate_candidates(expr, &ctx, out);
+    }
+    if let Some(expr) = select.qualify.as_ref() {
+        collect_predicate_candidates(expr, &ctx, out);
+    }
+
+    for item in &select.projection {
+        match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                collect_subqueries(expr, out);
+            }
+            SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => {}
+        }
+    }
+
+    for table_with_joins in &select.from {
+        collect_index_candidates_from_table_factor(&table_with_joins.relation, out);
+        for join in &table_with_joins.joins {
+            collect_index_candidates_from_table_factor(&join.relation, out);
+            let constraint = match &join.join_operator {
+                JoinOperator::Join(constraint)
+                | JoinOperator::Inner(constraint)
+                | JoinOperator::Left(constraint)
+                | JoinOperator::LeftOuter(constraint)
+                | JoinOperator::Right(constraint)
+                | JoinOperator::RightOuter(constraint)
+                | JoinOperator::FullOuter(constraint)
+                | JoinOperator::CrossJoin(constraint) => Some(constraint),
+                _ => None,
+            };
+            if let Some(sqlparser::ast::JoinConstraint::On(expr)) = constraint {
+                collect_predicate_candidates(expr, &ctx, out);
+            }
+        }
+    }
+}
+
+fn collect_index_candidates_from_table_factor(
+    table_factor: &TableFactor,
+    out: &mut BTreeSet<(String, String)>,
+) {
+    match table_factor {
+        TableFactor::Derived { subquery, .. } => collect_index_candidates_from_query(subquery, out),
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
+            if let TableFactor::Derived { subquery, .. } = &table_with_joins.relation {
+                collect_index_candidates_from_query(subquery, out);
+            }
+            for join in &table_with_joins.joins {
+                collect_index_candidates_from_table_factor(&join.relation, out);
+                if let JoinOperator::Join(sqlparser::ast::JoinConstraint::On(expr))
+                | JoinOperator::Inner(sqlparser::ast::JoinConstraint::On(expr))
+                | JoinOperator::Left(sqlparser::ast::JoinConstraint::On(expr))
+                | JoinOperator::LeftOuter(sqlparser::ast::JoinConstraint::On(expr))
+                | JoinOperator::Right(sqlparser::ast::JoinConstraint::On(expr))
+                | JoinOperator::RightOuter(sqlparser::ast::JoinConstraint::On(expr))
+                | JoinOperator::FullOuter(sqlparser::ast::JoinConstraint::On(expr))
+                | JoinOperator::CrossJoin(sqlparser::ast::JoinConstraint::On(expr)) =
+                    &join.join_operator
+                {
+                    collect_subqueries(expr, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_predicate_candidates(
+    expr: &Expr,
+    ctx: &ResolveContext,
+    out: &mut BTreeSet<(String, String)>,
+) {
+    if let Some(column_ref) = column_ref(expr) {
+        if let Some(table) = resolve_table_for_column_ref(&column_ref, ctx) {
+            out.insert((table, column_ref.column));
+        }
+        return;
+    }
+
+    match expr {
+        Expr::BinaryOp { left, right, .. } => {
+            collect_predicate_candidates(left, ctx, out);
+            collect_predicate_candidates(right, ctx, out);
+        }
+        Expr::UnaryOp { expr, .. } => collect_predicate_candidates(expr, ctx, out),
+        Expr::Nested(expr) => collect_predicate_candidates(expr, ctx, out),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_predicate_candidates(expr, ctx, out);
+            collect_predicate_candidates(low, ctx, out);
+            collect_predicate_candidates(high, ctx, out);
+        }
+        Expr::InList { expr, list, .. } => {
+            collect_predicate_candidates(expr, ctx, out);
+            for item in list {
+                collect_predicate_candidates(item, ctx, out);
+            }
+        }
+        Expr::InSubquery { expr, subquery, .. } => {
+            collect_predicate_candidates(expr, ctx, out);
+            collect_index_candidates_from_query(subquery, out);
+        }
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => {
+            collect_index_candidates_from_query(subquery, out);
+        }
+        Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::IsTrue(expr)
+        | Expr::IsNotTrue(expr)
+        | Expr::IsFalse(expr)
+        | Expr::IsNotFalse(expr)
+        | Expr::IsUnknown(expr)
+        | Expr::IsNotUnknown(expr) => collect_predicate_candidates(expr, ctx, out),
+        Expr::Like { expr, pattern, .. }
+        | Expr::ILike { expr, pattern, .. }
+        | Expr::SimilarTo { expr, pattern, .. }
+        | Expr::RLike { expr, pattern, .. } => {
+            collect_predicate_candidates(expr, ctx, out);
+            collect_predicate_candidates(pattern, ctx, out);
+        }
+        Expr::Cast { expr, .. } => collect_predicate_candidates(expr, ctx, out),
+        Expr::Function(func) => {
+            collect_function_subqueries(func, out);
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(operand) = operand.as_ref() {
+                collect_predicate_candidates(operand, ctx, out);
+            }
+            for when in conditions {
+                collect_predicate_candidates(&when.condition, ctx, out);
+                collect_predicate_candidates(&when.result, ctx, out);
+            }
+            if let Some(else_result) = else_result.as_ref() {
+                collect_predicate_candidates(else_result, ctx, out);
+            }
+        }
+        Expr::Tuple(items) => {
+            for item in items {
+                collect_predicate_candidates(item, ctx, out);
+            }
+        }
+        Expr::GroupingSets(items) | Expr::Cube(items) | Expr::Rollup(items) => {
+            for group in items {
+                for item in group {
+                    collect_predicate_candidates(item, ctx, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_subqueries(expr: &Expr, out: &mut BTreeSet<(String, String)>) {
+    match expr {
+        Expr::InSubquery { subquery, .. }
+        | Expr::Exists { subquery, .. }
+        | Expr::Subquery(subquery) => {
+            collect_index_candidates_from_query(subquery, out);
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_subqueries(left, out);
+            collect_subqueries(right, out);
+        }
+        Expr::UnaryOp { expr, .. } => collect_subqueries(expr, out),
+        Expr::Nested(expr) => collect_subqueries(expr, out),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_subqueries(expr, out);
+            collect_subqueries(low, out);
+            collect_subqueries(high, out);
+        }
+        Expr::InList { expr, list, .. } => {
+            collect_subqueries(expr, out);
+            for item in list {
+                collect_subqueries(item, out);
+            }
+        }
+        Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::IsTrue(expr)
+        | Expr::IsNotTrue(expr)
+        | Expr::IsFalse(expr)
+        | Expr::IsNotFalse(expr)
+        | Expr::IsUnknown(expr)
+        | Expr::IsNotUnknown(expr) => collect_subqueries(expr, out),
+        Expr::Like { expr, pattern, .. }
+        | Expr::ILike { expr, pattern, .. }
+        | Expr::SimilarTo { expr, pattern, .. }
+        | Expr::RLike { expr, pattern, .. } => {
+            collect_subqueries(expr, out);
+            collect_subqueries(pattern, out);
+        }
+        Expr::Cast { expr, .. } => collect_subqueries(expr, out),
+        Expr::Function(func) => collect_function_subqueries(func, out),
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(operand) = operand.as_ref() {
+                collect_subqueries(operand, out);
+            }
+            for when in conditions {
+                collect_subqueries(&when.condition, out);
+                collect_subqueries(&when.result, out);
+            }
+            if let Some(else_result) = else_result.as_ref() {
+                collect_subqueries(else_result, out);
+            }
+        }
+        Expr::Tuple(items) => {
+            for item in items {
+                collect_subqueries(item, out);
+            }
+        }
+        Expr::GroupingSets(items) | Expr::Cube(items) | Expr::Rollup(items) => {
+            for group in items {
+                for item in group {
+                    collect_subqueries(item, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_function_subqueries(
+    func: &sqlparser::ast::Function,
+    out: &mut BTreeSet<(String, String)>,
+) {
+    match &func.args {
+        sqlparser::ast::FunctionArguments::None => {}
+        sqlparser::ast::FunctionArguments::Subquery(query) => {
+            collect_index_candidates_from_query(query, out);
+        }
+        sqlparser::ast::FunctionArguments::List(list) => {
+            for arg in &list.args {
+                match arg {
+                    sqlparser::ast::FunctionArg::Unnamed(arg) => {
+                        if let sqlparser::ast::FunctionArgExpr::Expr(expr) = arg {
+                            collect_subqueries(expr, out);
+                        }
+                    }
+                    sqlparser::ast::FunctionArg::Named { arg, .. } => {
+                        if let sqlparser::ast::FunctionArgExpr::Expr(expr) = arg {
+                            collect_subqueries(expr, out);
+                        }
+                    }
+                    sqlparser::ast::FunctionArg::ExprNamed { name, arg, .. } => {
+                        collect_subqueries(name, out);
+                        if let sqlparser::ast::FunctionArgExpr::Expr(expr) = arg {
+                            collect_subqueries(expr, out);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn resolve_table_for_column_ref(column_ref: &ColumnRef, ctx: &ResolveContext) -> Option<String> {
+    match column_ref.qualifier.as_deref() {
+        Some(qualifier) => Some(
+            ctx.alias_to_table
+                .get(qualifier)
+                .cloned()
+                .unwrap_or_else(|| qualifier.to_string()),
+        ),
+        None => ctx.base_table.clone(),
+    }
+}
+
+fn select_has_wildcard(select: &sqlparser::ast::Select) -> bool {
+    select.projection.iter().any(|item| match item {
+        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => true,
+        SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. } => false,
+    })
+}
+
+fn estimate_index_benefit_ms(table: &str, columns: &[&str]) -> (u64, u64, u8) {
+    let row_count = mock_row_count(table);
+    let before_ms = (row_count / 4_000).max(1);
+
+    let mut key = String::new();
+    key.push_str(table);
+    for col in columns {
+        key.push('.');
+        key.push_str(col);
+    }
+
+    let hash = fnv1a64(key.as_bytes());
+    let divisor = 10 + (hash % 200); // 10..=209
+    let after_ms = (before_ms / divisor).max(1);
+
+    let pct = if before_ms <= after_ms {
+        0
+    } else {
+        (((before_ms - after_ms) * 100) / before_ms).min(99) as u8
+    };
+
+    (before_ms, after_ms, pct)
+}
+
+fn mock_row_count(table: &str) -> u64 {
+    // 50k..=5M rows (deterministic).
+    let hash = fnv1a64(table.as_bytes());
+    50_000 + (hash % 4_950_001)
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x00000100000001B3;
+
+    let mut hash = OFFSET_BASIS;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
 }
 
 fn build_alias_to_table(select: &sqlparser::ast::Select) -> HashMap<String, String> {
@@ -636,9 +1070,18 @@ SELECT * FROM users WHERE id = 3;
 SELECT * FROM users WHERE id = 4;
 SELECT * FROM users WHERE id = 5;
 "#;
-        let report = detect_n1_from_log(log, 5);
+        let report = detect_n1_from_log(
+            log,
+            N1Options {
+                threshold: 5,
+                window: 10,
+            },
+        );
         assert_eq!(report.findings.len(), 1);
-        assert_eq!(report.findings[0].count, 5);
+        assert_eq!(report.threshold, 5);
+        assert_eq!(report.window, 10);
+        assert_eq!(report.findings[0].max_count_in_window, 5);
+        assert_eq!(report.findings[0].total_count, 5);
         assert_eq!(
             report.findings[0].template,
             "select * from users where id = ?"
@@ -660,6 +1103,10 @@ SELECT * FROM users WHERE id = 5;
         let result = analyze("SELECT * FROM users WHERE age > 18").unwrap();
         assert_eq!(result.index_suggestions.len(), 1);
         assert_eq!(result.index_suggestions[0].table, "users");
-        assert_eq!(result.index_suggestions[0].column, "age");
+        assert_eq!(result.index_suggestions[0].columns, vec!["age"]);
+        assert_eq!(
+            result.index_suggestions[0].ddl,
+            "CREATE INDEX CONCURRENTLY idx_users_age ON users(age);"
+        );
     }
 }

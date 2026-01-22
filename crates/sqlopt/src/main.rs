@@ -23,6 +23,8 @@ enum Command {
         path: PathBuf,
         #[arg(long, default_value_t = 5)]
         threshold: usize,
+        #[arg(long, default_value_t = 50)]
+        window: usize,
     },
 }
 
@@ -39,7 +41,13 @@ fn main() -> anyhow::Result<()> {
                 println!("OK: No index suggestions.");
             } else {
                 for suggestion in result.index_suggestions {
-                    println!("SUGGESTION: {}", suggestion.statement);
+                    println!("SUGGESTION: {}", suggestion.ddl);
+                    println!(
+                        "ESTIMATED: {}ms -> {}ms ({}%)",
+                        suggestion.estimated_before_ms,
+                        suggestion.estimated_after_ms,
+                        suggestion.estimated_improvement_pct
+                    );
                 }
             }
         }
@@ -54,16 +62,30 @@ fn main() -> anyhow::Result<()> {
                 None => println!("OK: No rewrite available for this query."),
             }
         }
-        Command::DetectN1 { path, threshold } => {
+        Command::DetectN1 {
+            path,
+            threshold,
+            window,
+        } => {
             let contents = fs::read_to_string(&path)
                 .with_context(|| format!("failed to read log file {}", path.display()))?;
-            let report = sql_optimizer::detect_n1_from_log(&contents, threshold);
+            let report = sql_optimizer::detect_n1_from_log(
+                &contents,
+                sql_optimizer::N1Options { threshold, window },
+            );
             if report.findings.is_empty() {
-                println!("OK: No repeated query templates found (threshold={threshold}).");
+                println!(
+                    "OK: No repeated query templates found (threshold={threshold}, window={window})."
+                );
             } else {
-                println!("CRITICAL: Detected repeated query templates (threshold={threshold}).");
+                println!(
+                    "CRITICAL: Detected repeated query templates (threshold={threshold}, window={window})."
+                );
                 for finding in report.findings {
-                    println!("COUNT={} TEMPLATE={}", finding.count, finding.template);
+                    println!(
+                        "COUNT={} TOTAL={} TEMPLATE={}",
+                        finding.max_count_in_window, finding.total_count, finding.template
+                    );
                 }
             }
         }
