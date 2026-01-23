@@ -69,7 +69,7 @@ fn main() -> anyhow::Result<()> {
             window,
         } => {
             let file = fs::File::open(&path)
-                .with_context(|| format!("failed to read log file {}", path.display()))?;
+                .with_context(|| format!("failed to open log file {}", path.display()))?;
             let reader = BufReader::new(file);
             let report = sql_optimizer::detect_n1_from_reader(
                 reader,
