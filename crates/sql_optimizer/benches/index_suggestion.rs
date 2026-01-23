@@ -10,6 +10,11 @@ fn parse_iterations(args: impl Iterator<Item = String>) -> Result<u64, String> {
             return Err(usage());
         }
 
+        // `cargo bench` injects `--bench` even for `harness = false` targets.
+        if arg == "--bench" {
+            continue;
+        }
+
         if arg.starts_with('-') {
             return Err(format!("unknown argument: {arg}\n\n{}", usage()));
         }
