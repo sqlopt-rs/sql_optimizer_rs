@@ -19,7 +19,7 @@ sqlopt analyze "SELECT * FROM users WHERE age > 18"
 
 # Detect repeated query templates (common N+1 symptom)
 # (flags are counts-per-window-of-N-queries, not timestamps)
-sqlopt detect-n1 production.log --threshold 5 --window 50
+sqlopt detect-n1 examples/queries.log --threshold 5 --window 50
 
 # Heuristic rewrite (JOIN -> IN subquery) for simple filter joins
 sqlopt rewrite "SELECT o.* FROM orders o JOIN users u ON o.user_id = u.id WHERE u.active = true"
