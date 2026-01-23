@@ -30,14 +30,14 @@ sqlopt rewrite "SELECT o.* FROM orders o JOIN users u ON o.user_id = u.id WHERE 
 **Input:** a log file with many repeated queries.
 
 ```bash
-sqlopt detect-n1 production.log
+sqlopt detect-n1 examples/queries.log --threshold 5 --window 50
 ```
 
 **Output:**
 
 ```text
 CRITICAL: Detected repeated query templates (threshold=5, window=50).
-COUNT=50 TOTAL=5000 TEMPLATE=select * from comments where post_id = ?
+COUNT=50 TOTAL=847 TEMPLATE=select * from posts where user_id = ?
 ```
 
 Recommendation: batch/eager load related records when you see repeated templates; for index suggestions on a specific query, run `sqlopt analyze "..."`.
