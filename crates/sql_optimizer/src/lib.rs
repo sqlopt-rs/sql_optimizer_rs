@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::BufRead;
+use std::rc::Rc;
 
 use sqlparser::ast::{
     BinaryOperator, Expr, JoinOperator, ObjectNamePart, Query, SelectItem, SetExpr, Statement,
@@ -353,10 +354,10 @@ pub fn normalize_query_template(query: &str) -> String {
 struct N1Detector {
     threshold: usize,
     window: usize,
-    window_queue: VecDeque<String>,
-    window_counts: HashMap<String, usize>,
-    total_counts: HashMap<String, usize>,
-    max_in_window: HashMap<String, usize>,
+    window_queue: VecDeque<Rc<String>>,
+    window_counts: HashMap<Rc<String>, usize>,
+    total_counts: HashMap<Rc<String>, usize>,
+    max_in_window: HashMap<Rc<String>, usize>,
 }
 
 impl N1Detector {
@@ -377,7 +378,7 @@ impl N1Detector {
             return;
         }
 
-        let template = normalize_query_template(line);
+        let template = Rc::new(normalize_query_template(line));
         if template.is_empty() {
             return;
         }
@@ -421,7 +422,7 @@ impl N1Detector {
                     .copied()
                     .unwrap_or(max_count_in_window);
                 Some(N1Finding {
-                    template,
+                    template: template.as_ref().clone(),
                     max_count_in_window,
                     total_count,
                 })
