@@ -362,10 +362,11 @@ struct N1Detector {
 
 impl N1Detector {
     fn new(opts: N1Options) -> Self {
+        let window = opts.window.max(1);
         Self {
             threshold: opts.threshold.max(1),
-            window: opts.window.max(1),
-            window_queue: VecDeque::new(),
+            window,
+            window_queue: VecDeque::with_capacity(window),
             window_counts: HashMap::new(),
             total_counts: HashMap::new(),
             max_in_window: HashMap::new(),
