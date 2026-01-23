@@ -1,26 +1,54 @@
 # sql_optimizer_rs
 
-Rust-based SQL query analyzer / optimizer (MVP).
+[![crates.io](https://img.shields.io/crates/v/sqlopt.svg)](https://crates.io/crates/sqlopt)
+[![docs.rs](https://img.shields.io/docsrs/sqlopt)](https://docs.rs/sqlopt)
 
-## Build
+Blazingly fast SQL query analyzer. Detects N+1 queries and suggests indexes from your logs in seconds. Written in Rust.
+
+## Installation
 
 ```bash
-cargo build -p sqlopt
+cargo install sqlopt
 ```
 
 ## CLI usage
 
 ```bash
 # Suggest an index
-cargo run -p sqlopt -- analyze "SELECT * FROM users WHERE age > 18"
+sqlopt analyze "SELECT * FROM users WHERE age > 18"
 
 # Detect repeated query templates (common N+1 symptom)
 # (flags are counts-per-window-of-N-queries, not timestamps)
-cargo run -p sqlopt -- detect-n1 examples/queries.log --threshold 5 --window 50
+sqlopt detect-n1 examples/queries.log --threshold 5 --window 50
 
 # Heuristic rewrite (JOIN -> IN subquery) for simple filter joins
-cargo run -p sqlopt -- rewrite "SELECT o.* FROM orders o JOIN users u ON o.user_id = u.id WHERE u.active = true"
+sqlopt rewrite "SELECT o.* FROM orders o JOIN users u ON o.user_id = u.id WHERE u.active = true"
 ```
+
+## Quick Look
+
+**Input:** a log file with many repeated queries.
+
+```bash
+sqlopt detect-n1 examples/queries.log --threshold 5 --window 50
+```
+
+**Output:**
+
+```text
+CRITICAL: Detected repeated query templates (threshold=5, window=50).
+COUNT=50 TOTAL=847 TEMPLATE=select * from posts where user_id = ?
+```
+
+Recommendation: batch/eager load related records when you see repeated templates; for index suggestions on a specific query, run `sqlopt analyze "..."`.
+
+## How it works
+
+`sqlopt` reads SQL (and log files) as plain text and applies fast, deterministic heuristics:
+
+- `detect-n1` streams a log file line-by-line, normalizes each query template (strips values, collapses whitespace, lowercases), then uses a sliding window counter to flag repeated templates.
+- `analyze` parses SQL with `sqlparser` and suggests single-column indexes based on WHERE/JOIN predicate columns.
+- `rewrite` applies a narrow, guarded JOIN-to-IN rewrite and emits warnings when it does.
 
 ## Examples
 
@@ -31,19 +59,19 @@ cargo run -p sqlopt -- rewrite "SELECT o.* FROM orders o JOIN users u ON o.user_
 These are copied from real runs of the commands above.
 
 ```text
-$ cargo run -p sqlopt -- analyze "SELECT * FROM users WHERE age > 18"
+$ sqlopt analyze "SELECT * FROM users WHERE age > 18"
 SUGGESTION: CREATE INDEX CONCURRENTLY idx_users_age ON users(age);
 ESTIMATED: 1164ms -> 8ms (99%)
 ```
 
 ```text
-$ cargo run -p sqlopt -- detect-n1 examples/queries.log --threshold 5 --window 50
+$ sqlopt detect-n1 examples/queries.log --threshold 5 --window 50
 CRITICAL: Detected repeated query templates (threshold=5, window=50).
 COUNT=50 TOTAL=847 TEMPLATE=select * from posts where user_id = ?
 ```
 
 ```text
-$ cargo run -p sqlopt -- rewrite "SELECT o.* FROM orders o JOIN users u ON o.user_id = u.id WHERE u.active = true"
+$ sqlopt rewrite "SELECT o.* FROM orders o JOIN users u ON o.user_id = u.id WHERE u.active = true"
 ORIGINAL: SELECT o.* FROM orders o JOIN users u ON o.user_id = u.id WHERE u.active = true
 WARNING: avoid wildcard projections (SELECT *); select only needed columns
 WARNING: heuristic rewrite: verify projection if you relied on JOINed columns
@@ -61,7 +89,7 @@ Notes:
 
 | Tool | Language | Speed (1M queries) | N+1 Detect | Index Suggest | CLI |
 | --- | --- | ------------------: | :---: | :---: | :---: |
-| [sqlopt](https://github.com/sqlopt-rs/sql_optimizer_rs) | Rust | See benchmarks | Yes (heuristic) | Yes (heuristic) | Yes |
+| [sqlopt](https://github.com/sqlopt-rs/sql_optimizer_rs) | Rust | ~8.8s | Yes (heuristic) | Yes (heuristic) | Yes |
 | [sqlparser-rs](https://github.com/sqlparser-rs/sqlparser-rs) | Rust | N/A | No | No | No |
 | [Bullet](https://github.com/flyerhzm/bullet) | Ruby | N/A | Yes | No | No |
 | [Prosopite](https://github.com/charkost/prosopite) | Ruby | N/A | Yes | No | No |

@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::BufReader;
 use std::path::PathBuf;
 
 use anyhow::Context;
@@ -67,12 +68,14 @@ fn main() -> anyhow::Result<()> {
             threshold,
             window,
         } => {
-            let contents = fs::read_to_string(&path)
-                .with_context(|| format!("failed to read log file {}", path.display()))?;
-            let report = sql_optimizer::detect_n1_from_log(
-                &contents,
+            let file = fs::File::open(&path)
+                .with_context(|| format!("failed to open log file {}", path.display()))?;
+            let reader = BufReader::new(file);
+            let report = sql_optimizer::detect_n1_from_reader(
+                reader,
                 sql_optimizer::N1Options { threshold, window },
-            );
+            )
+            .with_context(|| format!("failed to read log file {}", path.display()))?;
             if report.findings.is_empty() {
                 println!(
                     "OK: No repeated query templates found (threshold={threshold}, window={window})."

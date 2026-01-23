@@ -122,7 +122,7 @@ fn e2e_detect_n1_errors_on_missing_log_file() {
     let (code, _stdout, stderr) =
         run_sqlopt(&["detect-n1", log_path.to_str().expect("utf-8 path")]);
     assert_ne!(code, 0, "stderr: {stderr}");
-    assert!(stderr.contains("failed to read log file"), "{stderr}");
+    assert!(stderr.contains("failed to open log file"), "{stderr}");
 }
 
 fn temp_log_path(file_name: &str) -> PathBuf {

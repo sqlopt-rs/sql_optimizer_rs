@@ -6,4 +6,8 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+repository = "https://github.com/sqlopt-rs/sql_optimizer_rs"
+
+[workspace.dependencies]
+sql_optimizer = { version = "0.1.0", path = "crates/sql_optimizer" }
 

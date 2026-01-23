@@ -1,4 +1,6 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::io::BufRead;
+use std::rc::Rc;
 
 use sqlparser::ast::{
     BinaryOperator, Expr, JoinOperator, ObjectNamePart, Query, SelectItem, SetExpr, Statement,
@@ -349,80 +351,115 @@ pub fn normalize_query_template(query: &str) -> String {
     out.trim().to_string()
 }
 
-pub fn detect_n1_from_log(log_contents: &str, opts: N1Options) -> N1Report {
-    let threshold = opts.threshold.max(1);
-    let window = opts.window.max(1);
+struct N1Detector {
+    threshold: usize,
+    window: usize,
+    window_queue: VecDeque<Rc<String>>,
+    window_counts: HashMap<Rc<String>, usize>,
+    total_counts: HashMap<Rc<String>, usize>,
+    max_in_window: HashMap<Rc<String>, usize>,
+}
 
-    let mut window_queue: VecDeque<String> = VecDeque::new();
-    let mut window_counts: HashMap<String, usize> = HashMap::new();
-    let mut total_counts: HashMap<String, usize> = HashMap::new();
-    let mut max_in_window: HashMap<String, usize> = HashMap::new();
+impl N1Detector {
+    fn new(opts: N1Options) -> Self {
+        let window = opts.window.max(1);
+        Self {
+            threshold: opts.threshold.max(1),
+            window,
+            window_queue: VecDeque::with_capacity(window),
+            window_counts: HashMap::new(),
+            total_counts: HashMap::new(),
+            max_in_window: HashMap::new(),
+        }
+    }
 
-    for line in log_contents.lines() {
+    fn observe_line(&mut self, line: &str) {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with("--") {
-            continue;
+            return;
         }
 
-        let template = normalize_query_template(line);
+        let template = Rc::new(normalize_query_template(line));
         if template.is_empty() {
-            continue;
+            return;
         }
 
-        *total_counts.entry(template.clone()).or_default() += 1;
+        *self.total_counts.entry(template.clone()).or_default() += 1;
 
-        window_queue.push_back(template.clone());
-        {
-            let entry = window_counts.entry(template.clone()).or_default();
-            *entry += 1;
-        }
-
-        if window_queue.len() > window {
-            if let Some(oldest) = window_queue.pop_front() {
-                if let Some(count) = window_counts.get_mut(&oldest) {
+        if self.window_queue.len() == self.window {
+            if let Some(oldest) = self.window_queue.pop_front() {
+                if let std::collections::hash_map::Entry::Occupied(mut entry) =
+                    self.window_counts.entry(oldest)
+                {
+                    let count = entry.get_mut();
                     *count = count.saturating_sub(1);
                     if *count == 0 {
-                        window_counts.remove(&oldest);
+                        entry.remove();
                     }
                 }
             }
         }
 
-        let current = window_counts.get(&template).copied().unwrap_or(0);
-        max_in_window
+        self.window_queue.push_back(template.clone());
+        let current = {
+            let entry = self.window_counts.entry(template.clone()).or_default();
+            *entry += 1;
+            *entry
+        };
+        self.max_in_window
             .entry(template)
             .and_modify(|max| *max = (*max).max(current))
             .or_insert(current);
     }
 
-    let mut findings = max_in_window
-        .into_iter()
-        .filter_map(|(template, max_count_in_window)| {
-            if max_count_in_window < threshold {
-                return None;
-            }
-            let total_count = total_counts
-                .get(&template)
-                .copied()
-                .unwrap_or(max_count_in_window);
-            Some(N1Finding {
-                template,
-                max_count_in_window,
-                total_count,
+    fn finish(self) -> N1Report {
+        let mut findings = self
+            .max_in_window
+            .into_iter()
+            .filter_map(|(template, max_count_in_window)| {
+                if max_count_in_window < self.threshold {
+                    return None;
+                }
+                let total_count = self
+                    .total_counts
+                    .get(&template)
+                    .copied()
+                    .unwrap_or(max_count_in_window);
+                Some(N1Finding {
+                    template: template.as_ref().clone(),
+                    max_count_in_window,
+                    total_count,
+                })
             })
-        })
-        .collect::<Vec<_>>();
-    findings.sort_by(|a, b| {
-        b.max_count_in_window
-            .cmp(&a.max_count_in_window)
-            .then_with(|| a.template.cmp(&b.template))
-    });
+            .collect::<Vec<_>>();
+        findings.sort_by(|a, b| {
+            b.max_count_in_window
+                .cmp(&a.max_count_in_window)
+                .then_with(|| a.template.cmp(&b.template))
+        });
 
-    N1Report {
-        threshold,
-        window,
-        findings,
+        N1Report {
+            threshold: self.threshold,
+            window: self.window,
+            findings,
+        }
     }
+}
+
+pub fn detect_n1_from_log(log_contents: &str, opts: N1Options) -> N1Report {
+    let mut detector = N1Detector::new(opts);
+    for line in log_contents.lines() {
+        detector.observe_line(line);
+    }
+    detector.finish()
+}
+
+pub fn detect_n1_from_reader<R: BufRead>(reader: R, opts: N1Options) -> std::io::Result<N1Report> {
+    let mut detector = N1Detector::new(opts);
+    for line in reader.lines() {
+        detector.observe_line(&line?);
+    }
+    Ok(detector.finish())
 }
 
 fn parse_single_statement(query: &str) -> Result<Statement, SqlOptError> {
@@ -1196,6 +1233,7 @@ fn strip_qualifier_in_order_by_expr(order_by: &mut sqlparser::ast::OrderByExpr, 
 mod tests {
     use super::*;
     use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
+    use std::io::Cursor;
 
     #[test]
     fn normalize_query_template_replaces_literals_and_numbers() {
@@ -1258,6 +1296,24 @@ SELECT * FROM users WHERE id = 5;
             report.findings[0].template,
             "select * from users where id = ?"
         );
+    }
+
+    #[test]
+    fn detect_n1_from_reader_matches_detect_n1_from_log() {
+        let log = r#"
+SELECT * FROM users WHERE id = 1;
+SELECT * FROM users WHERE id = 2;
+SELECT * FROM users WHERE id = 3;
+SELECT * FROM users WHERE id = 4;
+SELECT * FROM users WHERE id = 5;
+"#;
+        let opts = N1Options {
+            threshold: 5,
+            window: 10,
+        };
+        let from_log = detect_n1_from_log(log, opts.clone());
+        let from_reader = detect_n1_from_reader(Cursor::new(log), opts).expect("read report");
+        assert_eq!(from_reader, from_log);
     }
 
     #[test]
